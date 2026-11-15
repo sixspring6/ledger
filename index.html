@@ -610,10 +610,12 @@ const Store = {
   },
   async replaceAll(){
     if (this.kind !== 'cloud') return this.saveLocal();
-    const keep = new Set(Object.keys(REAL.months));
+    // 쓰는 도중 도착하는 스냅샷이 REAL.months를 바꿔도 영향이 없도록 시작 시점의 내용을 고정
+    const months = clone(REAL.months), bk = clone(REAL.book);
+    const keep = new Set(Object.keys(months));
+    await this.run('book', () => this.bookRef.set(bk));
     for (const mk of [...this.cloudMonths]) if (!keep.has(mk)) await this.run('m:' + mk, () => this.col.doc(mk).delete());
-    for (const mk of keep) await this.run('m:' + mk, () => this.col.doc(mk).set({items:clone(REAL.months[mk])}));
-    await this.saveBook();
+    for (const mk of keep) await this.run('m:' + mk, () => this.col.doc(mk).set({items:months[mk]}));
   },
   async wipe(){
     if (this.kind !== 'cloud'){ try { localStorage.removeItem(LS_BOOK); } catch {} return; }

@@ -1,7 +1,7 @@
 /* 개인 회계장부 서비스 워커: 오프라인에서도 앱이 열리도록 앱 파일을 캐시합니다.
    장부 데이터는 캐시가 아니라 브라우저 저장소(localStorage)에 있으므로 업데이트해도 지워지지 않습니다.
    앱 파일을 고친 뒤에는 VERSION 값을 올려 주세요. */
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CACHE = `pgl-shell-${VERSION}`;
 const FONTS = 'pgl-fonts';
 const SHELL = [
