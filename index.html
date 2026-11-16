@@ -581,6 +581,7 @@ const Store = {
   saveLocal(){
     const ok = lsSet(LS_BOOK, {v:1, book:REAL.book, months:REAL.months});
     if (!ok && S.note !== 'nosave'){ S.note = 'nosave'; render(); }
+    if (typeof syncTouched === 'function') syncTouched();
     return Promise.resolve();
   },
   saveBook(){
@@ -758,7 +759,7 @@ function demoBanner(){
 }
 function storageBanner(){
   if (S.note === 'nosave') return `<div class="banner"><div><b>이 브라우저에 저장할 수 없어요</b>비공개 모드이거나 저장 공간이 막혀 있어요. 설정에서 백업을 받아 두세요.</div></div>`;
-  if (S.mode !== 'live' || S.storage !== 'local') return '';
+  if (S.mode !== 'live' || S.storage !== 'local' || syncOn()) return '';
   const n = entries().length; const days = (Date.now() - (P.lastBackup || 0)) / 864e5;
   if (n >= 20 && days > 30) return `<div class="banner info"><div><b>백업할 때가 됐어요</b>이 기기에만 저장돼 있어요. 파일로 백업해 두세요.</div><a class="btn sm" href="#config">백업</a></div>`;
   return '';
@@ -1114,7 +1115,7 @@ function rTB(){
 function vConfig(){
   const b = book(); const live = S.mode === 'live';
   const where = S.storage === 'cloud' ? '<b>내 Claude 계정</b>에 비공개로 저장돼요. 이 링크를 여는 휴대폰·PC 어디서나 같은 장부가 보여요.'
-    : '<b>이 기기의 브라우저</b>에만 저장돼요. 다른 기기와 동기화되지 않으니 백업 파일을 정기적으로 받아 두세요.';
+    : syncOn() ? `<b>이 기기의 브라우저</b>에 저장되고, GitHub 비공개 저장소 <b>${esc(Sync.repo)}</b>와 동기화돼요.` : '<b>이 기기의 브라우저</b>에만 저장돼요. 다른 기기와 공유하려면 아래 GitHub 동기화를 켜거나 백업 파일을 쓰세요.';
   const E = entries(); const opening = E.find(e => e.kind === 'opening');
   const accGroups = TYPE_ORDER.map((t, i) => `<div class="grp-h"><span>${ROMAN[i]}. ${TYPES[t].name}</span><button class="linkbtn" data-act="acct-new" data-type="${t}">＋ 추가</button></div><ul class="rl">${accountsOf(t, true).map(a => `<li><button class="rrow ${a.active ? '' : 'dim'}" data-act="acct-edit" data-code="${a.code}"><span class="code">${a.code}</span><span class="nm">${esc(a.name)}${a.active ? '' : ' (사용 안 함)'}</span>${a.type === 'X' && a.budget ? `<span class="v small muted">예산 ${fmt(a.budget)}</span>` : ''}<span class="chev">${ICON.chev}</span></button></li>`).join('')}</ul>`).join('');
   return `${S.mode === 'demo' ? `<div class="banner"><div><b>예시 장부예요</b>내 장부를 시작하면 기본 계정과목 ${DEFAULT_ACCOUNTS.length}개로 빈 장부가 만들어져요.</div><button class="btn sm dark" data-act="start">시작</button></div>` : ''}
@@ -1126,6 +1127,8 @@ function vConfig(){
     <button class="btn block" data-act="opening">${opening ? '기초잔액 수정' : '기초잔액 입력 (개시분개)'}</button>
     ${INSTALL ? '<button class="btn pri block" data-act="install">홈 화면에 앱 설치</button>' : ''}
   </section>
+
+  ${syncCard()}
 
   <section class="card">
     <div class="sec-h" style="margin-bottom:2px"><h2>계정과목표</h2></div><p class="hint" style="margin-bottom:6px">코드 1xxx 자산 · 2xxx 부채 · 3xxx 자본 · 4xxx 수익 · 5xxx 비용</p>
@@ -1496,21 +1499,26 @@ async function exportCSV(){
   const ok = await saveFile(`분개장_${todayISO()}.csv`, '﻿' + rows.map(r => r.map(q).join(',')).join('\r\n'), 'text/csv');
   if (ok && !IN_CLAUDE) toast('CSV 파일을 저장했어요');
 }
+/** 백업(JSON) 텍스트를 장부로 해석. 실패하면 오류 문장(string)을 돌려줌 */
+function parseBackup(text){
+  let p; try { p = JSON.parse(text); } catch { return 'JSON 파일을 읽을 수 없어요'; }
+  if (!p || p.app !== 'personal-ledger' || !p.book || !Array.isArray(p.entries)) return '이 장부의 백업 파일이 아니에요';
+  const nb = normalizeBook(clone(p.book)); delete nb.demo;
+  const months = {}; let bad = 0;
+  for (const e of p.entries){
+    if (!e || typeof e.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(e.date) || !Array.isArray(e.lines)){ bad++; continue; }
+    const lines = e.lines.map(l => ({a:String(l.a), d:Math.max(0, Math.round(+l.d || 0)), c:Math.max(0, Math.round(+l.c || 0))}));
+    if (validateLines(lines)){ bad++; continue; }
+    const x = {id:String(e.id || uid()), no:String(e.no || ''), date:e.date, memo:String(e.memo || '').slice(0, 60), kind:KIND[e.kind] ? e.kind : 'journal', lines, ref:e.ref || null, revBy:e.revBy || null, ts:+e.ts || Date.now(), upd:+e.upd || null};
+    (months[ymOf(x.date)] || (months[ymOf(x.date)] = {}))[x.id] = x;
+  }
+  return {book:nb, months, n:p.entries.length - bad, bad, savedAt:p.exportedAt || p.savedAt || null};
+}
 function importFile(file){
   const rd = new FileReader();
   rd.onload = () => {
-    let p; try { p = JSON.parse(rd.result); } catch { return toast('JSON 파일을 읽을 수 없어요'); }
-    if (!p || p.app !== 'personal-ledger' || !p.book || !Array.isArray(p.entries)) return toast('이 장부의 백업 파일이 아니에요');
-    const nb = normalizeBook(clone(p.book)); delete nb.demo;
-    const months = {}; let bad = 0;
-    for (const e of p.entries){
-      if (!e || typeof e.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(e.date) || !Array.isArray(e.lines)){ bad++; continue; }
-      const lines = e.lines.map(l => ({a:String(l.a), d:Math.max(0, Math.round(+l.d || 0)), c:Math.max(0, Math.round(+l.c || 0))}));
-      if (validateLines(lines)){ bad++; continue; }
-      const x = {id:String(e.id || uid()), no:String(e.no || ''), date:e.date, memo:String(e.memo || '').slice(0, 60), kind:KIND[e.kind] ? e.kind : 'journal', lines, ref:e.ref || null, revBy:e.revBy || null, ts:+e.ts || Date.now(), upd:+e.upd || null};
-      (months[ymOf(x.date)] || (months[ymOf(x.date)] = {}))[x.id] = x;
-    }
-    const n = p.entries.length - bad;
+    const r = parseBackup(rd.result); if (typeof r === 'string') return toast(r);
+    const {book:nb, months, n, bad} = r;
     dialog({title:'백업을 불러올까요?', msg:`전표 ${n.toLocaleString()}건${bad ? ` (차대 불일치 등 ${bad}건 제외)` : ''}과 계정과목 ${nb.accounts.length}개로 현재 장부를 바꿔요. 지금 장부의 내용은 사라져요.`, ok:'불러오기', danger:true, onOk:async () => {
       REAL.book = nb; REAL.months = months; S.mode = 'live'; S.rev++; render();
       try { await Store.replaceAll(); toast(`전표 ${n.toLocaleString()}건을 불러왔어요`); } catch (e) { onStoreError(e); }
@@ -1519,10 +1527,194 @@ function importFile(file){
   rd.readAsText(file);
 }
 function wipeAll(){
-  dialog({title:'장부를 모두 지울까요?', msg:`전표 ${entries().length.toLocaleString()}건과 계정과목, 기초잔액이 모두 삭제돼요. 되돌릴 수 없어요.`, ok:'전체 삭제', danger:true, onOk:async () => {
+  dialog({title:'장부를 모두 지울까요?', msg:`전표 ${entries().length.toLocaleString()}건과 계정과목, 기초잔액이 모두 삭제돼요. 되돌릴 수 없어요.${syncOn() ? ' 이 기기의 GitHub 동기화도 꺼지고, GitHub의 장부 파일은 그대로 남아요.' : ''}`, ok:'전체 삭제', danger:true, onOk:async () => {
+    if (syncOn()){ Object.assign(Sync, {token:'', sha:null, dirty:false, at:0}); syncSave(); }
     REAL.book = null; REAL.months = {}; enterDemo(); location.hash = '#dashboard'; render();
     try { await Store.wipe(); toast('장부를 삭제했어요'); } catch (e) { onStoreError(e); }
   }});
+}
+
+/* ---------- GitHub 동기화 (GitHub Pages 버전 전용) ----------
+   비공개 저장소의 장부 파일(ledger.json) 하나를 여러 기기가 주고받는다.
+   GitHub Contents API의 sha로 "내가 마지막으로 본 버전"을 기억해, 다른 기기가 먼저 바꿨으면 충돌로 알린다. */
+const SYNC_KEY = 'pgl.sync.v1';
+const Sync = Object.assign({repo:'', branch:'', path:'ledger.json', token:'', auto:true, sha:null, at:0, dirty:false}, lsGet(SYNC_KEY) || {});
+const SYS = {busy:false, msg:'', err:'', applying:false, timer:0, lastCheck:0};
+const SD = {repo:Sync.repo || '', token:'', branch:Sync.branch || '', path:Sync.path || 'ledger.json'};
+let CF = null;
+function syncSave(){ lsSet(SYNC_KEY, Sync); }
+const syncOn = () => S.storage === 'local' && !!(Sync.repo && Sync.token);
+const syncRefresh = () => { if (S.view === 'config') render(); };
+function syncTouched(){
+  if (SYS.applying || !syncOn() || S.mode !== 'live') return;
+  Sync.dirty = true; syncSave();
+  if (Sync.auto){ clearTimeout(SYS.timer); SYS.timer = setTimeout(() => syncPush(), 2500); }
+}
+function deviceName(){ const u = navigator.userAgent; return /Android/.test(u) ? 'Android' : /iPhone|iPad/.test(u) ? 'iOS' : /Windows/.test(u) ? 'Windows' : /Mac/.test(u) ? 'Mac' : /Linux/.test(u) ? 'Linux' : '웹'; }
+function b64enc(str){ const b = new TextEncoder().encode(str); let bin = ''; for (let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(bin); }
+function b64dec(b64){ const bin = atob(String(b64).replace(/\s/g, '')); const b = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); return new TextDecoder().decode(b); }
+/** 전표 한 건을 한 줄로 저장해 Git에서 변경 내역(diff)이 전표 단위로 보이게 함 */
+function ledgerText(){
+  const E = entries();
+  return '{\n"app":"personal-ledger",\n"version":1,\n"savedAt":' + JSON.stringify(new Date().toISOString()) + ',\n"device":' + JSON.stringify(deviceName()) +
+    ',\n"book":' + JSON.stringify(REAL.book) + ',\n"entries":[\n' + E.map(e => JSON.stringify(e)).join(',\n') + '\n]\n}\n';
+}
+function ghPath(){ return `/repos/${Sync.repo}/contents/${Sync.path.split('/').map(encodeURIComponent).join('/')}`; }
+async function gh(method, path, body, accept){
+  return fetch('https://api.github.com' + path, {method, cache:'no-store',
+    headers:Object.assign({'Accept':accept || 'application/vnd.github+json', 'Authorization':'Bearer ' + Sync.token, 'X-GitHub-Api-Version':'2022-11-28'}, body ? {'Content-Type':'application/json'} : {}),
+    body:body ? JSON.stringify(body) : undefined});
+}
+async function ghErr(r, what){
+  let m = ''; try { m = (await r.json()).message || ''; } catch {}
+  const e = new Error(
+    r.status === 401 ? '토큰이 올바르지 않거나 만료됐어요. 새 토큰으로 다시 연결하세요.'
+    : r.status === 403 ? (/rate limit/i.test(m) ? 'GitHub 요청 한도를 넘었어요. 잠시 뒤 다시 시도하세요.' : '토큰에 이 저장소의 Contents 읽기·쓰기 권한이 없어요.')
+    : r.status === 404 ? `${what || '저장소'}를 찾을 수 없어요. 저장소 이름과 토큰의 저장소 접근 권한을 확인하세요.`
+    : `GitHub 오류 (${r.status}) ${m}`.trim());
+  e.status = r.status; return e;
+}
+async function getRemote(){
+  const q = Sync.branch ? `?ref=${encodeURIComponent(Sync.branch)}` : '';
+  const r = await gh('GET', ghPath() + q);
+  if (r.status === 404) return null;
+  if (!r.ok) throw await ghErr(r, '장부 파일');
+  const j = await r.json();
+  let text = j.encoding === 'base64' && j.content ? b64dec(j.content) : '';
+  if (!text){ const r2 = await gh('GET', ghPath() + q, null, 'application/vnd.github.raw+json'); if (!r2.ok) throw await ghErr(r2, '장부 파일'); text = await r2.text(); }
+  return {sha:j.sha, text};
+}
+function applyRemote(parsed, sha, quiet){
+  SYS.applying = true;
+  REAL.book = parsed.book; REAL.months = parsed.months; S.mode = 'live'; S.rev++;
+  Store.saveLocal();
+  SYS.applying = false;
+  Sync.sha = sha; Sync.dirty = false; Sync.at = Date.now(); syncSave();
+  SYS.msg = `GitHub에서 전표 ${parsed.n.toLocaleString()}건을 받았어요`; SYS.err = '';
+  render(); if (!quiet) toast(SYS.msg);
+}
+function openConflict(remote, parsed){
+  CF = {remote, parsed};
+  const when = parsed.savedAt ? new Date(parsed.savedAt).toLocaleString('ko-KR') : '알 수 없음';
+  openSheet(sheetHead('어느 장부를 쓸까요?') + `<div class="sh-b">
+    <p class="hint" style="color:var(--ink-2)">이 기기와 GitHub의 장부가 서로 다르게 바뀌었어요. 다른 기기에서 입력한 뒤 아직 받지 않은 상태에서 이 기기에서도 입력하면 생겨요.</p>
+    <dl class="kv"><dt>이 기기</dt><dd>전표 ${entries().length.toLocaleString()}건 · 순자산 ${fmt(position(monthEnd(ymOf(todayISO()))).net)}</dd>
+    <dt>GitHub</dt><dd>전표 ${parsed.n.toLocaleString()}건 · ${esc(when)} 저장</dd></dl>
+    <p class="hint">고르지 않은 쪽의 변경은 사라져요. 둘 다 필요하면 먼저 이 기기 장부를 백업 파일로 받아 두세요. GitHub 쪽 이전 내용은 저장소의 기록(History)에 남아요.</p>
+  </div><div class="sh-f"><div class="row"><button class="btn" data-act="sync-take-remote">GitHub 것 받기</button><button class="btn pri" data-act="sync-keep-local">이 기기 것 올리기</button></div><button class="btn sm" data-act="export-json">이 기기 장부 백업 먼저 받기</button></div>`);
+}
+async function syncPush(force){
+  if (!syncOn() || S.mode !== 'live' || SYS.busy) return;
+  clearTimeout(SYS.timer);
+  if (!navigator.onLine){ SYS.err = '오프라인이에요. 연결되면 자동으로 올릴게요.'; syncRefresh(); return; }
+  SYS.busy = true; SYS.err = ''; SYS.msg = 'GitHub에 올리는 중…'; syncRefresh();
+  try {
+    const n = entries().length;
+    const body = {message:`장부 동기화: 전표 ${n}건 (${deviceName()})`, content:b64enc(ledgerText())};
+    if (Sync.branch) body.branch = Sync.branch;
+    if (force !== undefined && force !== null) { if (force) body.sha = force; }
+    else if (Sync.sha) body.sha = Sync.sha;
+    let r = await gh('PUT', ghPath(), body);
+    if (r.status === 409 || r.status === 422){
+      const remote = await getRemote();
+      if (!remote){ delete body.sha; r = await gh('PUT', ghPath(), body); }   // GitHub에서 파일이 지워졌으면 새로 만들기
+      else if (remote.sha === Sync.sha && !body.sha){ body.sha = remote.sha; r = await gh('PUT', ghPath(), body); }
+      else {
+        const parsed = parseBackup(remote.text);
+        SYS.busy = false; SYS.msg = '';
+        if (typeof parsed === 'string'){ SYS.err = 'GitHub의 장부 파일 형식이 달라요: ' + parsed; syncRefresh(); return; }
+        openConflict(remote, parsed); return;
+      }
+    }
+    if (!r.ok) throw await ghErr(r);
+    const j = await r.json();
+    Sync.sha = j.content && j.content.sha; Sync.dirty = false; Sync.at = Date.now(); syncSave();
+    SYS.msg = `GitHub에 올렸어요 (전표 ${n.toLocaleString()}건)`;
+  } catch (e) {
+    SYS.err = e.message || '올리지 못했어요. 연결을 확인하세요.';
+  } finally { SYS.busy = false; syncRefresh(); }
+}
+async function syncPull(opts={}){
+  if (!syncOn() || SYS.busy) return;
+  if (!navigator.onLine){ if (opts.manual){ SYS.err = '오프라인이에요.'; syncRefresh(); } return; }
+  SYS.busy = true; SYS.err = ''; SYS.msg = 'GitHub 확인 중…'; syncRefresh();
+  let next = null;
+  try {
+    const remote = await getRemote();
+    SYS.lastCheck = Date.now();
+    if (!remote){
+      SYS.msg = S.mode === 'live' ? 'GitHub에 아직 장부 파일이 없어 지금 올릴게요.' : 'GitHub에 아직 장부가 없어요. 내 장부를 시작하면 자동으로 올라가요.';
+      if (S.mode === 'live'){ Sync.sha = null; next = () => syncPush(); }
+      return;
+    }
+    if (remote.sha === Sync.sha && S.mode === 'live' && !opts.force){ SYS.msg = '최신 상태예요'; Sync.at = Date.now(); syncSave(); if (Sync.dirty) next = () => syncPush(); return; }
+    const parsed = parseBackup(remote.text);
+    if (typeof parsed === 'string'){ SYS.err = 'GitHub의 장부 파일을 읽을 수 없어요: ' + parsed; return; }
+    const localHasData = S.mode === 'live' && entries().length > 0;
+    if (localHasData && (Sync.dirty || !Sync.sha) && !opts.force){ SYS.busy = false; SYS.msg = ''; openConflict(remote, parsed); return; }
+    SYS.busy = false; applyRemote(parsed, remote.sha, !opts.manual);
+  } catch (e) {
+    SYS.err = e.message || 'GitHub에서 받지 못했어요.';
+  } finally { SYS.busy = false; syncRefresh(); if (next) next(); }
+}
+/** 열 때·다시 볼 때: 올릴 게 있으면 올리고(충돌 검사 포함), 아니면 받기 */
+function syncAuto(){
+  if (!syncOn() || !Sync.auto || SYS.busy) return;
+  if (Date.now() - SYS.lastCheck < 15000) return;
+  SYS.lastCheck = Date.now();
+  if (Sync.dirty && S.mode === 'live') syncPush(); else syncPull();
+}
+async function syncConnect(){
+  const repo = SD.repo.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/+$/, '');
+  const token = SD.token.trim(), path = (SD.path.trim() || 'ledger.json').replace(/^\/+/, '');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)){ SYS.err = '저장소는 “아이디/저장소이름” 형태로 적어 주세요. 예: sixspring6/ledger-data'; return syncRefresh(); }
+  if (!token){ SYS.err = '토큰을 붙여 넣어 주세요.'; return syncRefresh(); }
+  Object.assign(Sync, {repo, token, path, branch:SD.branch.trim(), sha:null, dirty:false, at:0});
+  SYS.busy = true; SYS.err = ''; SYS.msg = '저장소 확인 중…'; syncRefresh();
+  try {
+    const r = await gh('GET', `/repos/${repo}`);
+    if (!r.ok) throw await ghErr(r);
+    const j = await r.json();
+    if (!j.private){ Sync.token = ''; Sync.repo = ''; throw new Error(`${repo}는 공개 저장소예요. 장부가 누구에게나 보이게 되니 비공개(Private) 저장소를 따로 만들어 연결하세요.`); }
+    if (!Sync.branch) Sync.branch = j.default_branch || 'main';
+    syncSave(); SD.token = '';
+    SYS.busy = false; SYS.msg = '연결됐어요';
+    await syncPull({manual:true});
+  } catch (e) {
+    syncSave(); SYS.err = e.message || '연결하지 못했어요.';
+  } finally { SYS.busy = false; syncRefresh(); }
+}
+function syncOff(){
+  dialog({title:'GitHub 동기화를 끌까요?', msg:'이 기기에 저장된 토큰을 지우고 동기화를 멈춰요. 장부와 GitHub의 파일은 그대로 남아요.', ok:'끄기', onOk:() => {
+    Object.assign(Sync, {token:'', sha:null, dirty:false, at:0}); syncSave(); SYS.msg = ''; SYS.err = ''; render(); toast('동기화를 껐어요');
+  }});
+}
+function syncCard(){
+  if (S.storage !== 'local') return `<section class="card stack"><div class="sec-h" style="margin:0"><h2>GitHub 동기화</h2></div><p class="hint">이 화면(Claude 버전)은 Claude 계정으로 자동 동기화돼요. Git 저장소로 장부를 주고받는 기능은 GitHub Pages 버전에서 쓸 수 있어요.</p></section>`;
+  const status = SYS.err ? `<p class="err">${esc(SYS.err)}</p>` : SYS.msg ? `<p class="hint" style="color:var(--ink-2)">${esc(SYS.msg)}</p>` : '';
+  if (syncOn()) return `<section class="card stack" id="sync-card">
+    <div class="sec-h" style="margin:0"><h2>GitHub 동기화</h2>${SYS.busy ? '<span class="pill plain">◌ 진행 중</span>' : Sync.dirty ? '<span class="pill warn">◐ 올릴 변경 있음</span>' : '<span class="pill ok">● 동기화됨</span>'}</div>
+    <dl class="kv"><dt>저장소</dt><dd class="num">${esc(Sync.repo)}</dd><dt>파일</dt><dd class="num">${esc(Sync.path)} · ${esc(Sync.branch || 'main')}</dd><dt>마지막 동기화</dt><dd>${Sync.at ? new Date(Sync.at).toLocaleString('ko-KR') : '—'}</dd></dl>
+    <label class="toggle"><span>자동 동기화 <span class="muted small">열 때 받고, 입력하면 올려요</span></span><input type="checkbox" id="sy-auto" ${Sync.auto ? 'checked' : ''}></label>
+    <div class="row2" style="grid-template-columns:1fr 1fr"><button class="btn" data-act="sync-pull" ${SYS.busy ? 'disabled' : ''}>GitHub에서 받기</button><button class="btn" data-act="sync-push" ${SYS.busy || S.mode !== 'live' ? 'disabled' : ''}>GitHub에 올리기</button></div>
+    ${status}
+    <button class="linkbtn" style="align-self:flex-start;color:var(--bad)" data-act="sync-off">동기화 끄기</button>
+  </section>`;
+  return `<section class="card stack" id="sync-card">
+    <div class="sec-h" style="margin:0"><h2>GitHub 동기화</h2><span class="pill plain">꺼짐</span></div>
+    <p class="hint" style="color:var(--ink-2)">비공개 GitHub 저장소에 장부 파일을 두고 여러 컴퓨터·휴대폰이 같은 장부를 쓰게 해요. 바뀔 때마다 Git 기록이 남아요.</p>
+    <label class="fld">비공개 저장소<input id="sy-repo" data-in="sd" data-k="repo" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sixspring6/ledger-data" value="${esc(SD.repo)}"></label>
+    <label class="fld">GitHub 토큰<input id="sy-token" data-in="sd" data-k="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…" value="${esc(SD.token)}"></label>
+    <details class="tbl"><summary>고급 설정 (브랜치·파일 경로)</summary><div class="row2" style="margin-top:8px"><label class="fld">브랜치<input id="sy-branch" data-in="sd" data-k="branch" autocomplete="off" placeholder="기본 브랜치" value="${esc(SD.branch)}"></label><label class="fld">파일 경로<input id="sy-path" data-in="sd" data-k="path" autocomplete="off" value="${esc(SD.path)}"></label></div></details>
+    <button class="btn pri block" data-act="sync-connect" ${SYS.busy ? 'disabled' : ''}>${SYS.busy ? '확인 중…' : '연결하기'}</button>
+    ${status}
+    <details class="tbl"><summary>토큰 만드는 법</summary><ol class="hint" style="padding-left:18px;margin:6px 0 0;line-height:1.7">
+      <li>GitHub → Settings → Developer settings → Personal access tokens → <b>Fine-grained tokens</b> → Generate new token</li>
+      <li>Repository access: <b>Only select repositories</b>에서 장부용 비공개 저장소 하나만 고르기</li>
+      <li>Permissions → Repository permissions → <b>Contents: Read and write</b></li>
+      <li>만든 토큰을 복사해 위 칸에 붙여 넣기</li></ol>
+      <p class="hint" style="margin-top:6px">토큰은 이 기기 브라우저에만 저장되고 GitHub에만 보내져요. 다른 사람이나 채팅에 알려 주지 마세요.</p></details>
+  </section>`;
 }
 
 /* ---------- 이벤트 ---------- */
@@ -1565,6 +1757,12 @@ const ACT = {
   wipe: () => wipeAll(),
   install: () => doInstall(),
   'install-hide': () => { P.installHide = true; savePrefs(); render(); },
+  'sync-connect': () => syncConnect(),
+  'sync-pull': () => syncPull({manual:true}),
+  'sync-push': () => syncPush(),
+  'sync-off': () => syncOff(),
+  'sync-take-remote': () => { const c = CF; closeSheet(); CF = null; if (c) applyRemote(c.parsed, c.remote.sha); },
+  'sync-keep-local': () => { const c = CF; closeSheet(); CF = null; if (c) syncPush(c.remote.sha); },
 };
 document.addEventListener('click', ev => {
   const t = ev.target.closest('[data-act]'); if (!t) return;
@@ -1589,6 +1787,7 @@ document.addEventListener('input', ev => {
       refreshEntryLive(); return;
     }
   }
+  if (t.dataset.in === 'sd'){ SD[t.dataset.k] = t.value; return; }
   if (O && t.dataset.in === 'ov'){ liveFormat(t); O.vals[t.dataset.code] = t.value; const tt = $('#o-tot'); if (tt) tt.innerHTML = openingTot(); return; }
   if (t.dataset.in === 'money') liveFormat(t);
 });
@@ -1600,6 +1799,7 @@ document.addEventListener('change', ev => {
   if (t.id === 'cfg-cur'){ const v = t.value; if (!CUR[v] || S.mode !== 'live') return;
     dialog({title:'표시 통화를 바꿀까요?', msg:`금액은 환산되지 않고 표시 기호와 소수 자릿수만 ${esc(CUR[v].label)}(으)로 바뀌어요.`, ok:'바꾸기', onOk:() => { REAL.book = {...REAL.book, currency:v}; S.rev++; render(); Store.saveBook().catch(onStoreError); }});
     t.value = book().currency; return; }
+  if (t.id === 'sy-auto'){ Sync.auto = t.checked; syncSave(); if (Sync.auto) { SYS.lastCheck = 0; syncAuto(); } return; }
   if (t.id === 'file-in' && t.files && t.files[0]) importFile(t.files[0]);
 });
 document.addEventListener('keydown', ev => {
@@ -1687,7 +1887,14 @@ async function boot(){
   }
   startLocal();
   if (!IN_CLAUDE) setupPWA();
+  syncAuto();
 }
+document.addEventListener('visibilitychange', () => {
+  if (S.storage !== 'local' || !syncOn()) return;
+  if (document.visibilityState === 'visible') syncAuto();
+  else if (Sync.dirty && Sync.auto) syncPush();
+});
+window.addEventListener('online', () => { if (syncOn() && Sync.dirty && Sync.auto) syncPush(); });
 function setupPWA(){
   try {
     const add = (rel, href, extra={}) => { if (document.querySelector(`link[rel="${rel}"]`)) return; const l = document.createElement('link'); l.rel = rel; l.href = href; Object.assign(l, extra); document.head.appendChild(l); };
